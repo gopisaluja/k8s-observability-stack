@@ -1,0 +1,20 @@
+---
+extends: default
+
+ignore: |
+  .build/
+
+rules:
+  # PromQL in alert rules is easier to read on one line than wrapped.
+  line-length:
+    max: 200
+    allow-non-breakable-inline-mappings: true
+  # GitHub Actions uses "on:" as a key.
+  truthy:
+    allowed-values: ["true", "false"]
+    check-keys: false
+  comments:
+    min-spaces-from-content: 2
+  indentation:
+    spaces: 2
+    indent-sequences: consistent

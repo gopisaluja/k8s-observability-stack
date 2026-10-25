@@ -1,0 +1,216 @@
+---
+# promtool unit tests for the example-api SLO recording rules and burn-rate alerts.
+#
+# promtool reads plain rule files, so the PrometheusRule manifests are unwrapped first:
+#   python3 scripts/extract-rules.py .build/rules alerts/*.yaml
+#   promtool test rules tests/*.test.yaml
+#
+# Test series start at t=0, so every rate() window is effectively "since t=0". That is
+# enough to check thresholds, the multi-window logic and annotations.
+#
+# SLI values are compared as round(ratio * 1e6) so the tests do not depend on the last
+# bits of floating-point results, which can differ between promtool versions and CPUs.
+rule_files:
+  - ../.build/rules/slo-example-api.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 1. ~2% of requests fail (20 of 1020/min): burn rate ~19.6x the 0.1% budget.
+  #    The fast-burn alert pages within minutes; the slow-burn alert follows after its 15m `for`.
+  - name: availability fast burn
+    interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="example-api", code="200"}'
+        values: '0+1000x120'
+      - series: 'http_requests_total{job="example-api", code="500"}'
+        values: '0+20x120'
+    promql_expr_test:
+      # 20 / 1020 = 0.019608 (burn rate 19.6x)
+      - expr: round(1e6 * slo:sli_error:ratio_rate5m{slo="availability"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{service="example-api", slo="availability"}'
+            value: 19608
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SLOAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              burn: fast
+              service: example-api
+              slo: availability
+            exp_annotations: &availability_fast
+              summary: example-api is burning its availability error budget fast.
+              description: >-
+                example-api is spending its 30-day availability error budget at 6x or more the
+                sustainable rate (2% of the budget gone in 1h, or 5% in 6h). At this pace the
+                whole monthly budget is gone in 2 to 5 days.
+              runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/slo.md#sloavailabilityfastburn
+      - eval_time: 10m
+        alertname: SLOAvailabilitySlowBurn
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SLOAvailabilitySlowBurn
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              burn: slow
+              service: example-api
+              slo: availability
+            exp_annotations: &availability_slow
+              summary: example-api is steadily burning its availability error budget.
+              description: >-
+                example-api has spent at least 10% of its 30-day availability error budget in
+                the last 1 to 3 days (burn rate 3x over 1d, or 1x over 3d). Not urgent, but the
+                SLO will be missed this month if nothing changes. Handle it in working hours.
+              runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/slo.md#sloavailabilityslowburn
+      - eval_time: 30m
+        alertname: SLOLatencyFastBurn
+        exp_alerts: []
+
+  # 2. Healthy service: 1 error per 2001 requests (~0.05%) is inside the 0.1% budget.
+  - name: availability within budget
+    interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="example-api", code="200"}'
+        values: '0+2000x120'
+      - series: 'http_requests_total{job="example-api", code="503"}'
+        values: '0+1x120'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SLOAvailabilityFastBurn
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: SLOAvailabilitySlowBurn
+        exp_alerts: []
+
+  # 3. No 5xx series at all: the SLI must be 0 (not empty) thanks to "or vector(0)".
+  - name: availability with no errors recorded
+    interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="example-api", code="200"}'
+        values: '0+1000x30'
+    promql_expr_test:
+      - expr: slo:sli_error:ratio_rate5m{slo="availability"}
+        eval_time: 20m
+        exp_samples:
+          - labels: 'slo:sli_error:ratio_rate5m{service="example-api", slo="availability"}'
+            value: 0
+
+  # 4. 0.2% errors (burn rate 2x): only the slow, ticket-level alert fires.
+  - name: availability slow burn only
+    interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="example-api", code="200"}'
+        values: '0+998x120'
+      - series: 'http_requests_total{job="example-api", code="500"}'
+        values: '0+2x120'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SLOAvailabilityFastBurn
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SLOAvailabilitySlowBurn
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              burn: slow
+              service: example-api
+              slo: availability
+            exp_annotations: *availability_slow
+
+  # 5. A 10-minute spike of ~9% errors that then stops. The long windows (1h, 6h) still
+  #    exceed the fast-burn thresholds afterwards, but the short windows (5m, 30m) do not,
+  #    so the page resolves about 30 minutes after the errors stop instead of hours later.
+  - name: availability fast burn resets after recovery
+    interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="example-api", code="200"}'
+        values: '0+1000x90'
+      - series: 'http_requests_total{job="example-api", code="500"}'
+        values: '0+100x10 1000+0x80'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: SLOAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              burn: fast
+              service: example-api
+              slo: availability
+            exp_annotations: *availability_fast
+      - eval_time: 50m
+        alertname: SLOAvailabilityFastBurn
+        exp_alerts: []
+    promql_expr_test:
+      # The 1h error ratio is still 1000 / 51000 = 1.96%, above the 1.44% fast-burn threshold ...
+      - expr: round(1e6 * slo:sli_error:ratio_rate1h{slo="availability"}) > 14400
+        eval_time: 50m
+        exp_samples:
+          - labels: '{service="example-api", slo="availability"}'
+            value: 19608
+      # ... but the 5m short window is clean, so the first tier cannot fire.
+      - expr: slo:sli_error:ratio_rate5m{slo="availability"}
+        eval_time: 50m
+        exp_samples:
+          - labels: 'slo:sli_error:ratio_rate5m{service="example-api", slo="availability"}'
+            value: 0
+
+  # 6. Latency: 20% of requests are slower than 300ms against a 1% budget (burn rate 20x).
+  - name: latency fast burn
+    interval: 1m
+    input_series:
+      - series: 'http_request_duration_seconds_bucket{job="example-api", le="0.1"}'
+        values: '0+500x60'
+      - series: 'http_request_duration_seconds_bucket{job="example-api", le="0.3"}'
+        values: '0+800x60'
+      - series: 'http_request_duration_seconds_bucket{job="example-api", le="+Inf"}'
+        values: '0+1000x60'
+      - series: 'http_request_duration_seconds_count{job="example-api"}'
+        values: '0+1000x60'
+    promql_expr_test:
+      # 1 - 800 / 1000 = 0.2
+      - expr: round(1e6 * slo:sli_error:ratio_rate5m{slo="latency"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{service="example-api", slo="latency"}'
+            value: 200000
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SLOLatencyFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              burn: fast
+              service: example-api
+              slo: latency
+            exp_annotations:
+              summary: example-api is burning its latency (300ms) error budget fast.
+              description: >-
+                example-api is spending its 30-day latency (300ms) error budget at 6x or more
+                the sustainable rate (2% of the budget gone in 1h, or 5% in 6h). At this pace
+                the whole monthly budget is gone in 2 to 5 days.
+              runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/slo.md#slolatencyfastburn
+      - eval_time: 10m
+        alertname: SLOAvailabilityFastBurn
+        exp_alerts: []
+
+  # 7. Latency within budget: 99.5% of requests under 300ms.
+  - name: latency within budget
+    interval: 1m
+    input_series:
+      - series: 'http_request_duration_seconds_bucket{job="example-api", le="0.3"}'
+        values: '0+995x120'
+      - series: 'http_request_duration_seconds_bucket{job="example-api", le="+Inf"}'
+        values: '0+1000x120'
+      - series: 'http_request_duration_seconds_count{job="example-api"}'
+        values: '0+1000x120'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SLOLatencyFastBurn
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: SLOLatencySlowBurn
+        exp_alerts: []

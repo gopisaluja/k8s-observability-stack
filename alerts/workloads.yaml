@@ -1,0 +1,118 @@
+---
+# Kubernetes workload alerts: crash loops, pods not ready, HPA saturation, PVC capacity.
+# Metrics: kube-state-metrics (job="kube-state-metrics") and kubelet volume stats (job="kubelet").
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: workload-alerts
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: k8s-observability-stack
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: kubernetes.workloads
+      rules:
+        - alert: KubePodCrashLooping
+          # kube-state-metrics only exposes the waiting reason while the container is waiting,
+          # so the series flaps between restarts. max_over_time smooths that out.
+          expr: |
+            max_over_time(kube_pod_container_status_waiting_reason{job="kube-state-metrics", reason="CrashLoopBackOff"}[5m]) >= 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Pod {{ $labels.namespace }}/{{ $labels.pod }} is crash looping.
+            description: >-
+              Container {{ $labels.container }} in pod {{ $labels.namespace }}/{{ $labels.pod }}
+              has been in CrashLoopBackOff for more than 15 minutes.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/workloads.md#kubepodcrashlooping
+
+        - alert: KubePodNotReady
+          # Pending or Running-but-not-Ready pods. Completed (Succeeded) and Failed pods are
+          # excluded; finished Jobs and evicted pods are not an availability problem.
+          expr: |
+            (
+              max by (namespace, pod) (kube_pod_status_ready{job="kube-state-metrics", condition="false"}) == 1
+            )
+            unless on (namespace, pod)
+            (
+              max by (namespace, pod) (kube_pod_status_phase{job="kube-state-metrics", phase=~"Succeeded|Failed"}) == 1
+            )
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Pod {{ $labels.namespace }}/{{ $labels.pod }} has not been ready for 15 minutes.
+            description: >-
+              Pod {{ $labels.namespace }}/{{ $labels.pod }} has been Pending or failing its
+              readiness probe for more than 15 minutes, so it receives no Service traffic.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/workloads.md#kubepodnotready
+
+        - alert: KubeHpaMaxedOut
+          expr: |
+            (
+              kube_horizontalpodautoscaler_status_current_replicas{job="kube-state-metrics"}
+                == on (namespace, horizontalpodautoscaler)
+              kube_horizontalpodautoscaler_spec_max_replicas{job="kube-state-metrics"}
+            )
+            and on (namespace, horizontalpodautoscaler)
+            (
+              kube_horizontalpodautoscaler_spec_max_replicas{job="kube-state-metrics"}
+                != on (namespace, horizontalpodautoscaler)
+              kube_horizontalpodautoscaler_spec_min_replicas{job="kube-state-metrics"}
+            )
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: HPA {{ $labels.namespace }}/{{ $labels.horizontalpodautoscaler }} is running at max replicas.
+            description: >-
+              HPA {{ $labels.namespace }}/{{ $labels.horizontalpodautoscaler }} has been at its
+              maximum of {{ $value }} replicas for 15 minutes. It cannot absorb more load; latency
+              and error SLOs for this workload are at risk.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/workloads.md#kubehpamaxedout
+
+    - name: kubernetes.storage
+      rules:
+        - alert: KubePersistentVolumeFillingUp
+          expr: |
+            (
+              kubelet_volume_stats_available_bytes{job="kubelet"}
+                / kubelet_volume_stats_capacity_bytes{job="kubelet"}
+              < 0.15
+            )
+            and kubelet_volume_stats_used_bytes{job="kubelet"} > 0
+            and predict_linear(kubelet_volume_stats_available_bytes{job="kubelet"}[6h], 4 * 24 * 3600) < 0
+            unless on (namespace, persistentvolumeclaim)
+              kube_persistentvolumeclaim_access_mode{job="kube-state-metrics", access_mode="ReadOnlyMany"} == 1
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} is predicted to fill up within 4 days.
+            description: >-
+              Volume claimed by {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} has
+              {{ $value | humanizePercentage }} free and, based on the last 6 hours, will be full
+              within 4 days.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/workloads.md#kubepersistentvolumefillingup
+
+        - alert: KubePersistentVolumeFillingUp
+          expr: |
+            (
+              kubelet_volume_stats_available_bytes{job="kubelet"}
+                / kubelet_volume_stats_capacity_bytes{job="kubelet"}
+              < 0.03
+            )
+            and kubelet_volume_stats_used_bytes{job="kubelet"} > 0
+            unless on (namespace, persistentvolumeclaim)
+              kube_persistentvolumeclaim_access_mode{job="kube-state-metrics", access_mode="ReadOnlyMany"} == 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} is almost full.
+            description: >-
+              Volume claimed by {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} has only
+              {{ $value | humanizePercentage }} free. The application will start failing writes.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/workloads.md#kubepersistentvolumefillingup

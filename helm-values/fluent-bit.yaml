@@ -1,0 +1,229 @@
+---
+# Values for fluent/fluent-bit 0.58.3 (Fluent Bit 5.1.x), pinned in scripts/install.sh.
+#
+# Pipeline (one DaemonSet pod per node):
+#   tail /var/log/containers  -> cri multiline parser (containerd/CRI-O format, re-joins split lines)
+#   kubernetes filter         -> pod metadata + JSON log bodies merged under "app"
+#   lua filter                -> es_index_prefix = "k8s-<namespace>"
+#   es output                 -> daily index per namespace: k8s-<namespace>-YYYY.MM.DD
+#   systemd (kubelet, containerd) -> k8s-node-YYYY.MM.DD
+#
+# Buffering: every input buffers to the node's disk (storage.type filesystem), so an
+# Elasticsearch outage or a Fluent Bit restart does not lose logs until the per-output
+# limit (storage.total_limit_size) is reached. Then the oldest chunks are dropped.
+kind: DaemonSet
+
+# The chart's "helm test" pod uses busybox:latest; not worth an unpinned image.
+testFramework:
+  enabled: false
+
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+
+# Ship logs from every node, including tainted pools (GPU, system, spot).
+tolerations:
+  - operator: Exists
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+env:
+  - name: ES_USER
+    valueFrom:
+      secretKeyRef:
+        name: fluent-bit-es-credentials
+        key: username
+  - name: ES_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: fluent-bit-es-credentials
+        key: password
+
+# Containerd/CRI-O only (dockershim is gone), so /var/lib/docker is not mounted.
+daemonSetVolumes:
+  - name: varlog
+    hostPath:
+      path: /var/log
+  - name: etcmachineid
+    hostPath:
+      path: /etc/machine-id
+      type: File
+  - name: flb-state
+    hostPath:
+      path: /var/fluent-bit/state
+      type: DirectoryOrCreate
+  - name: es-ca
+    secret:
+      secretName: logs-es-http-certs-public
+daemonSetVolumeMounts:
+  - name: varlog
+    mountPath: /var/log
+    readOnly: true
+  - name: etcmachineid
+    mountPath: /etc/machine-id
+    readOnly: true
+  - name: flb-state
+    mountPath: /var/fluent-bit/state
+  - name: es-ca
+    mountPath: /fluent-bit/tls
+    readOnly: true
+
+luaScripts:
+  index_prefix.lua: |
+    -- Adds es_index_prefix = "k8s-<namespace>"; the es output appends "-YYYY.MM.DD".
+    function set_index_prefix(tag, timestamp, record)
+      local ns = "unknown"
+      local k8s = record["kubernetes"]
+      if k8s ~= nil and k8s["namespace_name"] ~= nil then
+        ns = k8s["namespace_name"]
+      end
+      record["es_index_prefix"] = "k8s-" .. ns
+      -- 2 = record modified, keep the original timestamp
+      return 2, timestamp, record
+    end
+
+config:
+  service: |
+    [SERVICE]
+        Daemon                    Off
+        Flush                     {{ .Values.flush }}
+        Log_Level                 {{ .Values.logLevel }}
+        Parsers_File              /fluent-bit/etc/parsers.conf
+        Parsers_File              /fluent-bit/etc/conf/custom_parsers.conf
+        HTTP_Server               On
+        HTTP_Listen               0.0.0.0
+        HTTP_Port                 {{ .Values.metricsPort }}
+        Health_Check              On
+        # Filesystem buffering (survives restarts and Elasticsearch outages)
+        storage.path              /var/fluent-bit/state/flb-storage/
+        storage.sync              normal
+        storage.checksum          off
+        storage.max_chunks_up     128
+        storage.backlog.mem_limit 32M
+        storage.metrics           on
+        # Retry back-off: 5s base, capped at 5 minutes between attempts
+        scheduler.base            5
+        scheduler.cap             300
+
+  inputs: |
+    [INPUT]
+        Name              tail
+        Tag               kube.*
+        Path              /var/log/containers/*.log
+        # Our own logs are excluded so an Elasticsearch outage cannot turn into a
+        # feedback loop of Fluent Bit error lines. Read them with kubectl logs.
+        Exclude_Path      /var/log/containers/fluent-bit-*_logging_*.log
+        multiline.parser  cri
+        DB                /var/fluent-bit/state/tail-containers.db
+        DB.locking        true
+        Refresh_Interval  10
+        Rotate_Wait       30
+        Skip_Long_Lines   On
+        Buffer_Max_Size   1MB
+        storage.type      filesystem
+
+    [INPUT]
+        Name              systemd
+        Tag               host.*
+        Systemd_Filter    _SYSTEMD_UNIT=kubelet.service
+        Systemd_Filter    _SYSTEMD_UNIT=containerd.service
+        Read_From_Tail    On
+        Strip_Underscores On
+        DB                /var/fluent-bit/state/systemd.db
+        storage.type      filesystem
+
+  filters: |
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        Kube_Tag_Prefix     kube.var.log.containers.
+        # Parse JSON log lines and nest the fields under "app", so two teams logging
+        # "level" or "status" with different types cannot break each other's mappings.
+        Merge_Log           On
+        Merge_Log_Key       app
+        Keep_Log            Off
+        # Pods may pick a parser (fluentbit.io/parser) or opt out (fluentbit.io/exclude).
+        K8S-Logging.Parser  On
+        K8S-Logging.Exclude On
+        Labels              On
+        Annotations         Off
+        Buffer_Size         0
+
+    [FILTER]
+        Name    lua
+        Match   kube.*
+        script  /fluent-bit/scripts/index_prefix.lua
+        call    set_index_prefix
+
+  outputs: |
+    [OUTPUT]
+        Name                     es
+        Alias                    es_kube
+        Match                    kube.*
+        Host                     logs-es-http.logging.svc
+        Port                     9200
+        HTTP_User                ${ES_USER}
+        HTTP_Passwd              ${ES_PASSWORD}
+        tls                      On
+        tls.verify               On
+        tls.ca_file              /fluent-bit/tls/ca.crt
+        Suppress_Type_Name       On
+        Logstash_Format          On
+        Logstash_Prefix          k8s-unknown
+        Logstash_Prefix_Key      es_index_prefix
+        Logstash_DateFormat      %Y.%m.%d
+        Replace_Dots             On
+        Trace_Error              On
+        Buffer_Size              512KB
+        Workers                  2
+        # ~2.5h of retries at the 5 minute cap before a chunk is dropped
+        Retry_Limit              30
+        storage.total_limit_size 4G
+
+    [OUTPUT]
+        Name                     es
+        Alias                    es_node
+        Match                    host.*
+        Host                     logs-es-http.logging.svc
+        Port                     9200
+        HTTP_User                ${ES_USER}
+        HTTP_Passwd              ${ES_PASSWORD}
+        tls                      On
+        tls.verify               On
+        tls.ca_file              /fluent-bit/tls/ca.crt
+        Suppress_Type_Name       On
+        Logstash_Format          On
+        Logstash_Prefix          k8s-node
+        Logstash_DateFormat      %Y.%m.%d
+        Replace_Dots             On
+        Trace_Error              On
+        Buffer_Size              512KB
+        Retry_Limit              30
+        storage.total_limit_size 1G
+
+  # Built-in parsers.conf already provides "cri", "docker" and "json". These are extra
+  # parsers that pods can select with the annotation fluentbit.io/parser: <name>.
+  customParsers: |
+    # JSON logs with an RFC 3339 "time" field: use the application's timestamp.
+    [PARSER]
+        Name        json_app
+        Format      json
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+        Time_Keep   On
+
+    # Raw containerd/CRI-O line, for re-parsing logs collected without the cri
+    # multiline parser: "<time> <stdout|stderr> <P|F> <message>".
+    [PARSER]
+        Name        containerd
+        Format      regex
+        Regex       ^(?<time>[^ ]+) (?<stream>stdout|stderr) (?<logtag>[^ ]*) ?(?<log>.*)$
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+        Time_Keep   Off

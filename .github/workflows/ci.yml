@@ -1,0 +1,81 @@
+---
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Same Prometheus version as the chart pinned in scripts/install.sh deploys.
+  PROMETHEUS_IMAGE: prom/prometheus:v3.15.0
+  SHELLCHECK_IMAGE: koalaman/shellcheck:v0.11.0
+  PYTHON_VERSION: "3.12"
+  HELM_VERSION: v3.22.1
+
+jobs:
+  lint:
+    name: yamllint, dashboards, alert hygiene
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install linters
+        run: pip install yamllint==1.38.0 PyYAML==6.0.3
+      - name: yamllint
+        run: yamllint --strict .
+      - name: Validate dashboard JSON
+        run: python3 scripts/check-dashboards.py
+      - name: Alert hygiene (severity, annotations, runbook links)
+        run: python3 scripts/lint-alerts.py
+
+  prometheus-rules:
+    name: promtool check and unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install PyYAML
+        run: pip install PyYAML==6.0.3
+      # promtool reads plain rule files; the repo stores PrometheusRule CRDs.
+      - name: Unwrap spec.groups from PrometheusRule manifests
+        run: python3 scripts/extract-rules.py .build/rules alerts/*.yaml
+      - name: promtool check rules
+        run: >-
+          docker run --rm --entrypoint promtool -v "$PWD:/w:ro" -w /w "$PROMETHEUS_IMAGE"
+          check rules .build/rules/*.yaml
+      - name: promtool test rules
+        run: >-
+          docker run --rm --entrypoint promtool -v "$PWD:/w:ro" -w /w "$PROMETHEUS_IMAGE"
+          test rules tests/*.yaml
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: shellcheck scripts
+        run: docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK_IMAGE" scripts/*.sh
+
+  helm-template:
+    name: render Helm charts with repo values
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      # Uses the chart versions pinned in scripts/install.sh; fails on values the charts reject.
+      - name: helm template (all releases)
+        run: scripts/install.sh template

@@ -1,0 +1,18 @@
+---
+# Values for elastic/eck-operator 3.5.0 (pinned in scripts/install.sh).
+# ECK runs Elasticsearch and Kibana as custom resources: it handles TLS, users, rolling
+# upgrades and safe scale-down, which a plain StatefulSet chart leaves to you.
+
+# Only reconcile the logging namespace. Keeps the operator's RBAC blast radius small.
+managedNamespaces:
+  - logging
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 150Mi
+  limits:
+    memory: 512Mi
+
+telemetry:
+  disabled: true

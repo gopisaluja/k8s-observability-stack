@@ -1,0 +1,80 @@
+---
+# Control-plane alerts: API server availability, latency and errors, plus etcd disk latency.
+# On managed clusters (EKS, GKE, AKS) etcd is not scrapeable and EtcdHighFsyncDurations
+# simply never fires; the API server alerts still work through the kubernetes Service.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: control-plane-alerts
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: k8s-observability-stack
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: kubernetes.control-plane
+      rules:
+        - alert: KubeAPIServerDown
+          expr: |
+            absent(up{job="apiserver"} == 1)
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: No Kubernetes API server target has been up for 15 minutes.
+            description: >-
+              Prometheus cannot scrape any API server endpoint. Either the control plane is down
+              (deployments, scaling and kubectl are broken) or Prometheus lost access to it
+              (RBAC, network policy, expired token).
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/control-plane.md#kubeapiserverdown
+
+        - alert: KubeAPIServerLatencyHigh
+          # LIST/WATCH are excluded: large LISTs are legitimately slow and WATCH is long-lived.
+          # 1s matches the upstream API server SLI for resource-scoped (GET/mutating) calls.
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le, verb, resource) (
+                rate(apiserver_request_duration_seconds_bucket{job="apiserver", verb!~"LIST|WATCH|CONNECT", subresource!~"log|exec|portforward|attach|proxy"}[5m])
+              )
+            ) > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: API server p99 latency for {{ $labels.verb }} {{ $labels.resource }} is above 1s.
+            description: >-
+              The 99th percentile latency of {{ $labels.verb }} requests on {{ $labels.resource }}
+              has been {{ $value | humanizeDuration }} for 10 minutes. Controllers, admission
+              webhooks and kubectl will feel slow; deployments may time out.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/control-plane.md#kubeapiserverlatencyhigh
+
+        - alert: KubeAPIServerErrorsHigh
+          expr: |
+            sum(rate(apiserver_request_total{job="apiserver", code=~"5.."}[5m]))
+              /
+            sum(rate(apiserver_request_total{job="apiserver"}[5m]))
+            > 0.05
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: More than 5% of API server requests are failing with 5xx.
+            description: >-
+              {{ $value | humanizePercentage }} of API server requests returned 5xx over the last
+              10 minutes. Controllers and deployments will fail or retry.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/control-plane.md#kubeapiservererrorshigh
+
+        - alert: EtcdHighFsyncDurations
+          expr: |
+            histogram_quantile(0.99,
+              sum by (instance, le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket{job=~".*etcd.*"}[5m]))
+            ) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: etcd member {{ $labels.instance }} has slow WAL fsyncs.
+            description: >-
+              99th percentile WAL fsync latency on {{ $labels.instance }} is {{ $value | humanizeDuration }}
+              (healthy is well under 10ms). Slow disks cause leader elections and API latency.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/control-plane.md#etcdhighfsyncdurations

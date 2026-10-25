@@ -1,0 +1,48 @@
+---
+# Values for prometheus-community/prometheus-elasticsearch-exporter 7.4.0 (exporter v1.11),
+# pinned in scripts/install.sh. Feeds the Elasticsearch alerts and the logging dashboard.
+fullnameOverride: elasticsearch-exporter
+
+es:
+  uri: https://logs-es-http.logging.svc:9200
+  all: true
+  # Per-index and per-shard metrics multiply by (namespaces x days of retention) with
+  # per-namespace daily indices. Cluster and node level metrics are enough for alerting.
+  indices: false
+  indices_settings: false
+  indices_mappings: false
+  shards: false
+  snapshots: false
+  ssl:
+    enabled: true
+    useExistingSecrets: true  # trust the CA that ECK publishes, mounted below
+    ca:
+      path: /ssl/ca.crt
+    client:
+      enabled: false
+
+# Read-only "monitor" user created by scripts/install.sh (role defined in elasticsearch.yaml).
+extraEnvSecrets:
+  ES_USERNAME:
+    secret: es-exporter-credentials
+    key: username
+  ES_PASSWORD:
+    secret: es-exporter-credentials
+    key: password
+
+secretMounts:
+  - name: es-ca
+    secretName: logs-es-http-certs-public
+    path: /ssl
+
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 20s
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 32Mi
+  limits:
+    memory: 128Mi

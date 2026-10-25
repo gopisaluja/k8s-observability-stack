@@ -1,0 +1,135 @@
+---
+# promtool unit tests for the Kubernetes workload alerts (alerts/workloads.yaml).
+# See tests/slo-example-api.test.yaml for how to run them.
+rule_files:
+  - ../.build/rules/workloads.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # A container stuck in CrashLoopBackOff pages Slack after 15 minutes, not before.
+  - name: crash loop fires after 15 minutes
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_waiting_reason{job="kube-state-metrics", namespace="payments", pod="api-6d4cf56db6-x7k2p", container="api", reason="CrashLoopBackOff"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KubePodCrashLooping
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: KubePodCrashLooping
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: kube-state-metrics
+              namespace: payments
+              pod: api-6d4cf56db6-x7k2p
+              container: api
+              reason: CrashLoopBackOff
+            exp_annotations:
+              summary: Pod payments/api-6d4cf56db6-x7k2p is crash looping.
+              description: >-
+                Container api in pod payments/api-6d4cf56db6-x7k2p has been in CrashLoopBackOff
+                for more than 15 minutes.
+              runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/workloads.md#kubepodcrashlooping
+
+  # kube-state-metrics drops the series while the container is briefly running between
+  # back-offs. The alert must keep firing through those gaps instead of resetting.
+  - name: crash loop with gaps between restarts
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_waiting_reason{job="kube-state-metrics", namespace="payments", pod="worker-0", container="worker", reason="CrashLoopBackOff"}'
+        values: '1 _x2 1 _x2 1 _x2 1 _x2 1 _x2 1 _x2 1 _x2 1 _x2 1 _x2'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KubePodCrashLooping
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: kube-state-metrics
+              namespace: payments
+              pod: worker-0
+              container: worker
+              reason: CrashLoopBackOff
+            exp_annotations:
+              summary: Pod payments/worker-0 is crash looping.
+              description: >-
+                Container worker in pod payments/worker-0 has been in CrashLoopBackOff for more
+                than 15 minutes.
+              runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/workloads.md#kubepodcrashlooping
+
+  # A pod that crash-looped for 8 minutes and then recovered never alerts.
+  - name: short crash loop does not alert
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_waiting_reason{job="kube-state-metrics", namespace="payments", pod="api-6d4cf56db6-q9w8e", container="api", reason="CrashLoopBackOff"}'
+        values: '1x8'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: KubePodCrashLooping
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: KubePodCrashLooping
+        exp_alerts: []
+
+  # Pending pods alert; pods of a completed Job (Succeeded, Ready=false) do not.
+  - name: pod not ready ignores completed pods
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_status_ready{job="kube-state-metrics", namespace="payments", pod="api-6d4cf56db6-pend1", condition="false"}'
+        values: '1x30'
+      - series: 'kube_pod_status_phase{job="kube-state-metrics", namespace="payments", pod="api-6d4cf56db6-pend1", phase="Pending"}'
+        values: '1x30'
+      - series: 'kube_pod_status_phase{job="kube-state-metrics", namespace="payments", pod="api-6d4cf56db6-pend1", phase="Succeeded"}'
+        values: '0x30'
+      - series: 'kube_pod_status_ready{job="kube-state-metrics", namespace="payments", pod="db-migrate-29xkq", condition="false"}'
+        values: '1x30'
+      - series: 'kube_pod_status_phase{job="kube-state-metrics", namespace="payments", pod="db-migrate-29xkq", phase="Succeeded"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KubePodNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: payments
+              pod: api-6d4cf56db6-pend1
+            exp_annotations:
+              summary: Pod payments/api-6d4cf56db6-pend1 has not been ready for 15 minutes.
+              description: >-
+                Pod payments/api-6d4cf56db6-pend1 has been Pending or failing its readiness probe
+                for more than 15 minutes, so it receives no Service traffic.
+              runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/workloads.md#kubepodnotready
+
+  # An HPA pinned at max replicas alerts; one with min == max (a fixed size) does not.
+  - name: hpa maxed out
+    interval: 1m
+    input_series:
+      - series: 'kube_horizontalpodautoscaler_status_current_replicas{job="kube-state-metrics", namespace="shop", horizontalpodautoscaler="web"}'
+        values: '10x30'
+      - series: 'kube_horizontalpodautoscaler_spec_max_replicas{job="kube-state-metrics", namespace="shop", horizontalpodautoscaler="web"}'
+        values: '10x30'
+      - series: 'kube_horizontalpodautoscaler_spec_min_replicas{job="kube-state-metrics", namespace="shop", horizontalpodautoscaler="web"}'
+        values: '2x30'
+      - series: 'kube_horizontalpodautoscaler_status_current_replicas{job="kube-state-metrics", namespace="shop", horizontalpodautoscaler="fixed"}'
+        values: '3x30'
+      - series: 'kube_horizontalpodautoscaler_spec_max_replicas{job="kube-state-metrics", namespace="shop", horizontalpodautoscaler="fixed"}'
+        values: '3x30'
+      - series: 'kube_horizontalpodautoscaler_spec_min_replicas{job="kube-state-metrics", namespace="shop", horizontalpodautoscaler="fixed"}'
+        values: '3x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KubeHpaMaxedOut
+        exp_alerts:
+          # Vector matching with on(...) keeps only the matching labels.
+          - exp_labels:
+              severity: warning
+              namespace: shop
+              horizontalpodautoscaler: web
+            exp_annotations:
+              summary: HPA shop/web is running at max replicas.
+              description: >-
+                HPA shop/web has been at its maximum of 10 replicas for 15 minutes. It cannot
+                absorb more load; latency and error SLOs for this workload are at risk.
+              runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/workloads.md#kubehpamaxedout

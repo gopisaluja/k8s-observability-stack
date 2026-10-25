@@ -1,0 +1,118 @@
+---
+# Node-level alerts: disk, memory and node readiness.
+# Metrics: node-exporter (job="node-exporter") and kube-state-metrics (job="kube-state-metrics").
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: node-alerts
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: k8s-observability-stack
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: node.disk
+      rules:
+        - alert: NodeFilesystemSpaceFillingUp
+          # Only fires when the disk is already below 20% free AND the 6h trend says it
+          # will be full within 24h. Static-but-full disks (e.g. image cache) stay quiet.
+          expr: |
+            (
+              node_filesystem_avail_bytes{job="node-exporter", fstype!~"tmpfs|overlay|squashfs|ramfs", mountpoint!=""}
+                / node_filesystem_size_bytes{job="node-exporter", fstype!~"tmpfs|overlay|squashfs|ramfs", mountpoint!=""}
+              < 0.20
+            )
+            and
+            predict_linear(node_filesystem_avail_bytes{job="node-exporter", fstype!~"tmpfs|overlay|squashfs|ramfs", mountpoint!=""}[6h], 24 * 3600) < 0
+            and
+            node_filesystem_readonly{job="node-exporter", fstype!~"tmpfs|overlay|squashfs|ramfs", mountpoint!=""} == 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: Filesystem {{ $labels.mountpoint }} on node {{ $labels.node }} is predicted to fill up within 24 hours.
+            description: >-
+              Filesystem {{ $labels.mountpoint }} ({{ $labels.device }}) on node {{ $labels.node }}
+              ({{ $labels.instance }}) has {{ $value | humanizePercentage }} space left and is filling up at a rate
+              that will exhaust it within 24 hours.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/node.md#nodefilesystemspacefillingup
+
+        - alert: NodeFilesystemAlmostOutOfSpace
+          expr: |
+            (
+              node_filesystem_avail_bytes{job="node-exporter", fstype!~"tmpfs|overlay|squashfs|ramfs", mountpoint!=""}
+                / node_filesystem_size_bytes{job="node-exporter", fstype!~"tmpfs|overlay|squashfs|ramfs", mountpoint!=""}
+              < 0.05
+            )
+            and
+            node_filesystem_readonly{job="node-exporter", fstype!~"tmpfs|overlay|squashfs|ramfs", mountpoint!=""} == 0
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: Filesystem {{ $labels.mountpoint }} on node {{ $labels.node }} has less than 5% space left.
+            description: >-
+              Filesystem {{ $labels.mountpoint }} ({{ $labels.device }}) on node {{ $labels.node }}
+              ({{ $labels.instance }}) has only {{ $value | humanizePercentage }} space left. Kubelet image GC and pod
+              eviction are likely, and writes on this filesystem will start to fail.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/node.md#nodefilesystemalmostoutofspace
+
+        - alert: NodeDiskPressure
+          expr: |
+            kube_node_status_condition{job="kube-state-metrics", condition="DiskPressure", status="true"} == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Node {{ $labels.node }} reports DiskPressure.
+            description: >-
+              Kubelet on {{ $labels.node }} has set the DiskPressure condition for more than 5 minutes.
+              It is garbage-collecting images and may evict pods; new pods will not be scheduled there.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/node.md#nodediskpressure
+
+    - name: node.memory
+      rules:
+        - alert: NodeMemoryHighUtilization
+          expr: |
+            100 * (
+              1 - node_memory_MemAvailable_bytes{job="node-exporter"}
+                / node_memory_MemTotal_bytes{job="node-exporter"}
+            ) > 90
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Node {{ $labels.node }} is using more than 90% of its memory.
+            description: >-
+              Memory utilisation on node {{ $labels.node }} ({{ $labels.instance }}) has been {{ printf "%.1f" $value }}% for
+              15 minutes. Expect OOM kills or kubelet MemoryPressure evictions if it keeps growing.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/node.md#nodememoryhighutilization
+
+        - alert: NodeMemoryPressure
+          expr: |
+            kube_node_status_condition{job="kube-state-metrics", condition="MemoryPressure", status="true"} == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Node {{ $labels.node }} reports MemoryPressure.
+            description: >-
+              Kubelet on {{ $labels.node }} has set the MemoryPressure condition for more than 5 minutes
+              and is evicting pods, starting with BestEffort and Burstable pods above their requests.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/node.md#nodememorypressure
+
+    - name: node.status
+      rules:
+        - alert: NodeNotReady
+          expr: |
+            kube_node_status_condition{job="kube-state-metrics", condition="Ready", status="true"} == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Node {{ $labels.node }} has been NotReady for 15 minutes.
+            description: >-
+              {{ $labels.node }} is not Ready. Pods on it are not being updated and will be evicted
+              after the taint toleration period. Check capacity: if several nodes are NotReady at
+              once this is probably a zone, network or control-plane problem, not a node problem.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/node.md#nodenotready

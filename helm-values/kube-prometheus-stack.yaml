@@ -1,0 +1,268 @@
+---
+# Values for prometheus-community/kube-prometheus-stack, chart version 92.11.0
+# (pinned in scripts/install.sh). Only settings that differ from the chart defaults are here.
+#
+# Assumes a managed control plane (EKS/GKE/AKS). On self-managed clusters (kubeadm, RKE2)
+# set kubeControllerManager/kubeScheduler/kubeEtcd/kubeProxy.enabled back to true.
+#
+# Secrets this file expects in the "monitoring" namespace (created by scripts/install.sh):
+#   alertmanager-receivers  keys: slack-webhook-url, pagerduty-routing-key, deadmansswitch-url
+#   grafana-admin           keys: admin-user, admin-password
+
+# --- Rules -------------------------------------------------------------------------------
+defaultRules:
+  create: true
+  rules:
+    windows: false
+  # These upstream alerts are replaced by the versions in alerts/, which have runbooks in
+  # this repo, tuned thresholds and unit tests. Keeping both would double-notify.
+  disabled:
+    KubePodCrashLooping: true
+    KubePodNotReady: true
+    KubeHpaMaxedOut: true
+    KubePersistentVolumeFillingUp: true
+    KubeNodeNotReady: true
+    KubeAPIDown: true
+    NodeFilesystemSpaceFillingUp: true
+    NodeFilesystemAlmostOutOfSpace: true
+    NodeMemoryHighUtilization: true
+
+# Not scrapeable on managed control planes; leaving them on only creates "target down" noise.
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+# node-exporter runs on the host network, so "instance" is <node IP>:9100. Add the node
+# name as well, so node alerts can be matched with kubectl output and kube-state-metrics.
+prometheus-node-exporter:
+  prometheus:
+    monitor:
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+          action: replace
+
+# --- Prometheus ----------------------------------------------------------------------------
+prometheus:
+  prometheusSpec:
+    # Pick up ServiceMonitors, PodMonitors, Probes and PrometheusRules from every namespace,
+    # not only those labelled release=kube-prometheus-stack. Teams ship their own monitors.
+    ruleSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+
+    scrapeInterval: 30s
+    evaluationInterval: 30s
+
+    # Overridden per cluster by scripts/install.sh (CLUSTER_NAME). Attached to every alert,
+    # so one Alertmanager/Slack channel can serve several clusters.
+    externalLabels:
+      cluster: change-me
+
+    # Local retention: 15 days or 45GB, whichever is hit first. The size cap sits below the
+    # 50Gi volume so compaction and WAL replay never run the disk full. Longer history
+    # belongs in remote storage (Thanos, Mimir, a managed service), not on this PVC.
+    retention: 15d
+    retentionSize: 45GB
+    walCompression: true
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi
+
+    # Sized for roughly 100-150k active series. Watch prometheus_tsdb_head_series and
+    # container memory on the cluster overview dashboard and adjust.
+    resources:
+      requests:
+        cpu: 500m
+        memory: 3Gi
+      limits:
+        memory: 6Gi
+
+# --- Alertmanager --------------------------------------------------------------------------
+alertmanager:
+  alertmanagerSpec:
+    replicas: 2  # HA pair; the replicas gossip so each notification is sent once
+    retention: 120h
+    # Mounted at /etc/alertmanager/secrets/<secret>/<key>; the config below reads
+    # webhook URLs and keys from files so no credential is ever in this file or in Git.
+    secrets:
+      - alertmanager-receivers
+    storage:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 2Gi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+
+  # Routing (see README "How alert routing works"):
+  #   critical -> PagerDuty (page) and #alerts-critical
+  #   warning  -> #alerts-warning, no page
+  #   info     -> nowhere; visible in Alertmanager/Grafana only
+  #   Watchdog -> dead man's switch heartbeat, so a dead pipeline is noticed
+  config:
+    global:
+      resolve_timeout: 5m
+      slack_api_url_file: /etc/alertmanager/secrets/alertmanager-receivers/slack-webhook-url
+    route:
+      receiver: slack-warning  # fallback: an alert without a severity is still seen
+      group_by: ["cluster", "alertname", "namespace"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      routes:
+        - receiver: deadmansswitch
+          matchers:
+            - alertname = "Watchdog"
+          group_wait: 0s
+          group_interval: 1m
+          repeat_interval: 1m
+        - receiver: "null"
+          matchers:
+            - alertname = "InfoInhibitor"
+        - receiver: pagerduty-critical
+          matchers:
+            - severity = "critical"
+          repeat_interval: 1h
+          continue: true  # also post to Slack via the next route
+        - receiver: slack-critical
+          matchers:
+            - severity = "critical"
+          repeat_interval: 1h
+        - receiver: slack-warning
+          matchers:
+            - severity = "warning"
+          repeat_interval: 12h
+        - receiver: "null"
+          matchers:
+            - severity = "info"
+
+    inhibit_rules:
+      # A critical alert mutes the warning version of the same problem
+      # (e.g. PVC 97% full mutes PVC "filling up").
+      - source_matchers:
+          - severity = "critical"
+        target_matchers:
+          - severity =~ "warning|info"
+        equal: ["cluster", "alertname", "namespace", "persistentvolumeclaim", "instance"]
+      # Fast SLO burn already paged; the slow burn for the same SLO is redundant.
+      - source_matchers:
+          - burn = "fast"
+        target_matchers:
+          - burn = "slow"
+        equal: ["cluster", "service", "slo"]
+      # A disk that is already almost full does not also need a "will fill up" alert.
+      - source_matchers:
+          - alertname = "NodeFilesystemAlmostOutOfSpace"
+        target_matchers:
+          - alertname = "NodeFilesystemSpaceFillingUp"
+        equal: ["cluster", "instance", "mountpoint"]
+      # Elasticsearch RED explains Fluent Bit delivery failures; notify on the cause only.
+      - source_matchers:
+          - alertname = "ElasticsearchClusterRed"
+        target_matchers:
+          - alertname =~ "FluentBitOutputErrors|FluentBitPipelineStalled"
+        equal: ["cluster"]
+      # Upstream InfoInhibitor: info alerts only matter while something else is firing.
+      - source_matchers:
+          - alertname = "InfoInhibitor"
+        target_matchers:
+          - severity = "info"
+        equal: ["namespace"]
+
+    receivers:
+      - name: "null"
+      - name: deadmansswitch
+        webhook_configs:
+          - url_file: /etc/alertmanager/secrets/alertmanager-receivers/deadmansswitch-url
+            send_resolved: false
+      - name: pagerduty-critical
+        pagerduty_configs:
+          - routing_key_file: /etc/alertmanager/secrets/alertmanager-receivers/pagerduty-routing-key
+            send_resolved: true
+            severity: critical
+            description: '{{ template "k8s.title" . }}'
+            links:
+              - href: '{{ .CommonAnnotations.runbook_url }}'
+                text: Runbook
+      - name: slack-critical
+        slack_configs:
+          - channel: "#alerts-critical"
+            send_resolved: true
+            color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+            title: '{{ template "k8s.title" . }}'
+            text: '{{ template "k8s.slack.text" . }}'
+      - name: slack-warning
+        slack_configs:
+          - channel: "#alerts-warning"
+            send_resolved: true
+            color: '{{ if eq .Status "firing" }}warning{{ else }}good{{ end }}'
+            title: '{{ template "k8s.title" . }}'
+            text: '{{ template "k8s.slack.text" . }}'
+
+    templates:
+      - /etc/alertmanager/config/*.tmpl
+
+  templateFiles:
+    k8s.tmpl: |-
+      {{ define "k8s.title" -}}
+      [{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }}
+      {{- with .CommonLabels.cluster }} | {{ . }}{{ end }}
+      {{- with .CommonLabels.namespace }} | {{ . }}{{ end }}
+      {{- end }}
+
+      {{ define "k8s.slack.text" -}}
+      {{ range .Alerts -}}
+      *{{ .Labels.severity | toUpper }}* {{ .Annotations.summary }}
+      {{ .Annotations.description }}
+      {{- with .Annotations.runbook_url }}
+      Runbook: {{ . }}{{ end }}
+      {{ end }}
+      {{- end }}
+
+# --- Grafana -------------------------------------------------------------------------------
+grafana:
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  defaultDashboardsTimezone: utc
+  # Dashboards are code (ConfigMaps from dashboards/), so the Grafana pod keeps no state
+  # worth a volume. UI edits are lost on restart by design; export and commit instead.
+  persistence:
+    enabled: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  sidecar:
+    dashboards:
+      enabled: true
+      # Any ConfigMap with this label, in any namespace, is loaded as a dashboard.
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+      # ...and placed in the Grafana folder named by this annotation.
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true
+        allowUiUpdates: false

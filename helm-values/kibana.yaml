@@ -1,0 +1,28 @@
+---
+# Values for elastic/eck-kibana 0.20.0 (pinned in scripts/install.sh).
+# Connects to the "logs" Elasticsearch cluster; ECK wires up TLS and the service account.
+#
+# Access: kubectl -n logging port-forward svc/logs-kb-http 5601
+# Then create a data view for "k8s-*" (one index per namespace per day).
+fullnameOverride: logs
+version: 9.5.0
+count: 1
+
+elasticsearchRef:
+  name: logs
+
+config:
+  # Set this to the external URL when Kibana is exposed through an Ingress.
+  # server.publicBaseUrl: https://kibana.example.com
+  telemetry.optIn: false
+
+podTemplate:
+  spec:
+    containers:
+      - name: kibana
+        resources:
+          requests:
+            cpu: 250m
+            memory: 1Gi
+          limits:
+            memory: 1Gi

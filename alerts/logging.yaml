@@ -1,0 +1,102 @@
+---
+# Logging pipeline alerts: Fluent Bit delivery and Elasticsearch health.
+# Metrics: Fluent Bit /api/v2/metrics/prometheus (job="fluent-bit") and
+# prometheus-elasticsearch-exporter (job="elasticsearch-exporter").
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: logging-alerts
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: k8s-observability-stack
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: logging.fluent-bit
+      rules:
+        - alert: FluentBitOutputErrors
+          # Short bursts (e.g. HTTP 429 from Elasticsearch) are retried and are normal;
+          # only sustained errors are worth a look.
+          expr: |
+            sum by (namespace, pod, name) (rate(fluentbit_output_errors_total{job="fluent-bit"}[5m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Fluent Bit {{ $labels.pod }} output {{ $labels.name }} has been failing for 15 minutes.
+            description: >-
+              Output {{ $labels.name }} on {{ $labels.namespace }}/{{ $labels.pod }} is returning
+              errors ({{ $value | humanize }}/s). Records are being retried from the filesystem
+              buffer; if this continues the buffer fills and records are dropped.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/logging.md#fluentbitoutputerrors
+
+        - alert: FluentBitOutputRetriesFailed
+          expr: |
+            sum by (namespace, pod, name) (increase(fluentbit_output_retries_failed_total{job="fluent-bit"}[10m])) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: Fluent Bit {{ $labels.pod }} dropped log chunks after exhausting retries.
+            description: >-
+              Output {{ $labels.name }} on {{ $labels.namespace }}/{{ $labels.pod }} gave up on
+              {{ $value | humanize }} chunk(s) in the last 10 minutes. Those log records are lost.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/logging.md#fluentbitoutputretriesfailed
+
+        - alert: FluentBitPipelineStalled
+          expr: |
+            sum by (namespace, pod) (rate(fluentbit_input_records_total{job="fluent-bit"}[10m])) > 0
+            and
+            sum by (namespace, pod) (rate(fluentbit_output_proc_records_total{job="fluent-bit"}[10m])) == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Fluent Bit {{ $labels.pod }} is reading logs but not delivering any.
+            description: >-
+              {{ $labels.namespace }}/{{ $labels.pod }} has ingested records for 15 minutes without
+              successfully flushing any to an output. Logs from this node are not reaching Elasticsearch.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/logging.md#fluentbitpipelinestalled
+
+    - name: logging.elasticsearch
+      rules:
+        - alert: ElasticsearchClusterRed
+          expr: |
+            max by (cluster) (elasticsearch_cluster_health_status{color="red"}) == 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Elasticsearch cluster {{ $labels.cluster }} is RED.
+            description: >-
+              At least one primary shard is unassigned. Writes to the affected indices fail and
+              searches return partial results. Log ingestion is degraded.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/logging.md#elasticsearchclusterred
+
+        - alert: ElasticsearchClusterYellow
+          expr: |
+            max by (cluster) (elasticsearch_cluster_health_status{color="yellow"}) == 1
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: Elasticsearch cluster {{ $labels.cluster }} has been YELLOW for 30 minutes.
+            description: >-
+              One or more replica shards are unassigned. Data is still available, but losing
+              another node could lose data or turn the cluster red.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/logging.md#elasticsearchclusteryellow
+
+        - alert: ElasticsearchDiskSpaceLow
+          expr: |
+            elasticsearch_filesystem_data_available_bytes
+              / elasticsearch_filesystem_data_size_bytes
+            < 0.15
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Elasticsearch node {{ $labels.name }} has less than 15% disk left.
+            description: >-
+              Node {{ $labels.name }} has {{ $value | humanizePercentage }} disk left. It is past
+              the 85% low watermark, so no new shards are placed on it. At 95% (flood stage)
+              Elasticsearch makes its indices read-only and ingestion stops.
+            runbook_url: https://github.com/gopisaluja/k8s-observability-stack/blob/main/docs/runbooks/logging.md#elasticsearchdiskspacelow
